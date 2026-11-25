@@ -87,14 +87,15 @@ app.get('/api/data',auth(),async(req,res)=>{
 });
 app.put('/api/tasks/:id/status',auth(['Faculty']),async(req,res)=>{
   if(!sheetsEnabled&&process.env.NODE_ENV==='production')return res.status(503).json({error:'Google Sheets is not configured for this deployment.'});
-  const {status}=req.body||{};
+  const {status,completionPercent}=req.body||{};
   if(!['Not started','In progress','Completed'].includes(status))return res.status(400).json({error:'Invalid task status.'});
+  if(!Number.isInteger(completionPercent)||completionPercent<0||completionPercent>100)return res.status(400).json({error:'Completion must be a whole number from 0 to 100.'});
   try{
     const data=await getAll();
     const task=data.tasks.find(t=>t.id===req.params.id&&(t.facultyIds||[t.facultyId]).includes(req.user.facultyId));
     if(!task)return res.status(404).json({error:'Task not found.'});
-    if(!await updateTaskStatus(req.params.id,req.user.facultyId,status))return res.status(404).json({error:'Task not found.'});
-    res.json({task:{...task,status}});
+    if(!await updateTaskStatus(req.params.id,req.user.facultyId,status,completionPercent))return res.status(404).json({error:'Task not found.'});
+    res.json({task:{...task,status,completionPercent}});
   }catch(e){res.status(503).json({error:`Could not update task: ${e.message}`})}
 });
 app.put('/api/admin/data',auth(['HOD']),async(req,res)=>{

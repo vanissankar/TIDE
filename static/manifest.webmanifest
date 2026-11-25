@@ -1,7 +1,7 @@
-﻿{
+{
   "id": "/",
-  "name": "FacultyOS · CSE Workload Monitor",
-  "short_name": "FacultyOS",
+  "name": "TIDE · CSE Workload Monitor",
+  "short_name": "TIDE",
   "description": "CSE faculty workload and task monitor.",
   "start_url": "/",
   "scope": "/",

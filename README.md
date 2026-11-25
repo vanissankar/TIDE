@@ -1,4 +1,4 @@
-# FacultyOS · CSE Workload Monitor
+# TIDE · CSE Workload Monitor
 
 Responsive workload app built with React, Vite, Tailwind CSS, Node and Express. Locally, Vite serves the frontend on port 5173 and Express serves the API on port 4000. Vercel serves the Vite build and Express API from this project.
 

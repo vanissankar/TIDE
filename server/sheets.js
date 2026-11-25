@@ -104,7 +104,7 @@ function mapTables(tableData) {
       responsibilityId: String(r.responsibility_id || ''),
       category: String(responsibility?.responsibility_name || r.category || 'Academic'),
       assignedDate: dateValue(r.assigned_date), startDate: dateValue(r.start_date), createdAt: dateValue(r.created_at),
-      dueDate: dateValue(r.deadline), status: normalizeStatus(r.status),
+      dueDate: dateValue(r.deadline), status: normalizeStatus(r.status), completionPercent: Math.max(0, Math.min(100, Number(r.completion_percent || 0))),
       priority: String(r.priority || 'Medium'), description: String(r.task_description || ''),
     };
   }).filter(task => task.id && task.title && !['cancelled', 'canceled', 'archived'].includes(String(
@@ -179,9 +179,9 @@ async function readSingleTable(title) {
   const response = await sheets.spreadsheets.values.get({ spreadsheetId: id, range: `'${title}'!A:Z`, valueRenderOption: 'UNFORMATTED_VALUE' });
   return parseTable(response.data.values);
 }
-async function appendStatusUpdate(taskId, facultyId, oldStatus, newStatus) {
+async function appendStatusUpdate(taskId, facultyId, oldStatus, newStatus, completionPercent) {
   const table = await readSingleTable(tabs.updates);
-  const fields = { update_id: `U-${Date.now()}`, task_id: taskId, faculty_id: facultyId, old_status: oldStatus, new_status: newStatus, updated_at: new Date().toISOString() };
+  const fields = { update_id: `U-${Date.now()}`, task_id: taskId, faculty_id: facultyId, old_status: oldStatus, new_status: newStatus, completion_percent: completionPercent, updated_at: new Date().toISOString() };
   const values = Array(table.headers.length).fill('');
   for (const [header, value] of Object.entries(fields)) {
     const col = table.headers.indexOf(header);
@@ -189,11 +189,12 @@ async function appendStatusUpdate(taskId, facultyId, oldStatus, newStatus) {
   }
   if (table.headers.length) await sheets.spreadsheets.values.append({ spreadsheetId: id, range: `'${tabs.updates}'!A:Z`, valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values: [values] } });
 }
-export async function updateTaskStatus(taskId, facultyId, status) {
+export async function updateTaskStatus(taskId, facultyId, status, completionPercent) {
   if (!sheetsEnabled) {
     const task = demo.tasks.find(item => item.id === taskId && item.facultyId === facultyId);
     if (!task) return false;
     task.status = status;
+    task.completionPercent = completionPercent;
     return true;
   }
   const table = await readSingleTable(tabs.tasks);
@@ -204,9 +205,17 @@ export async function updateTaskStatus(taskId, facultyId, status) {
   const faculty = (await readSingleTable(tabs.faculty)).rows.map(({ record: r }) => ({ id: String(r.faculty_id || ''), name: String(r.faculty_name || ''), email: String(r.email || ''), username: String(r.username || '') }));
   const row = table.rows.find(item => String(item.values[idIndex] || '') === taskId);
   if (!row || !findFacultyIds(row.values[assignedIndex], faculty).includes(facultyId)) return false;
+  let progressIndex = table.headers.indexOf('completion_percent');
+  if (progressIndex < 0) {
+    progressIndex = table.headers.length;
+    await sheets.spreadsheets.values.update({ spreadsheetId: id, range: `'${tabs.tasks}'!${columnName(progressIndex)}1`, valueInputOption: 'RAW', requestBody: { values: [['completion_percent']] } });
+  }
   const oldStatus = normalizeStatus(row.values[statusIndex]);
-  await sheets.spreadsheets.values.update({ spreadsheetId: id, range: `'${tabs.tasks}'!${columnName(statusIndex)}${row.rowNumber}`, valueInputOption: 'RAW', requestBody: { values: [[status]] } });
-  await appendStatusUpdate(taskId, facultyId, oldStatus, status);
+  await sheets.spreadsheets.values.batchUpdate({ spreadsheetId: id, requestBody: { valueInputOption: 'RAW', data: [
+    { range: `'${tabs.tasks}'!${columnName(statusIndex)}${row.rowNumber}`, values: [[status]] },
+    { range: `'${tabs.tasks}'!${columnName(progressIndex)}${row.rowNumber}`, values: [[completionPercent]] },
+  ] } });
+  await appendStatusUpdate(taskId, facultyId, oldStatus, status, completionPercent);
   return true;
 }
 export async function saveAll(data) {
@@ -220,7 +229,7 @@ export async function saveAll(data) {
   }));
   await updateExistingRows(tabs.tasks, data.tasks || [], 'task_id', item => ({
     task_title: text(item.title), task_description: text(item.description), assigned_to: (item.facultyIds?.length ? item.facultyIds : item.facultyId ? [item.facultyId] : []).join(', '),
-    assigned_date: text(item.assignedDate), start_date: text(item.startDate), deadline: text(item.dueDate), status: text(item.status), responsibility_id: text(item.responsibilityId || before.responsibilities.rows.find(({ record }) => String(record.responsibility_name || '') === text(item.category))?.record.responsibility_id),
+    assigned_date: text(item.assignedDate), start_date: text(item.startDate), deadline: text(item.dueDate), status: text(item.status), completion_percent: Number(item.completionPercent || 0), responsibility_id: text(item.responsibilityId || before.responsibilities.rows.find(({ record }) => String(record.responsibility_name || '') === text(item.category))?.record.responsibility_id),
   }));
 
   // Deletion in the dashboard archives rows instead of removing spreadsheet history.
