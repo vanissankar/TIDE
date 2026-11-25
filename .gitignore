@@ -1,0 +1,9 @@
+node_modules/
+dist/
+/public/
+.env
+.env.*
+!.env.example
+service-account*.json
+indigo-kiln-456415-j6-*.json
+*.log
