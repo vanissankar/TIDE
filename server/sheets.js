@@ -37,8 +37,7 @@ const truthy = value => ['true', 'yes', '1', 'active'].includes(String(value ?? 
 const normalizeStatus = value => {
   const status = String(value || '').trim().toLowerCase();
   if (['completed', 'complete', 'done', 'closed'].includes(status)) return 'Completed';
-  if (['in progress', 'in-progress', 'ongoing', 'started'].includes(status)) return 'In progress';
-  return 'Not started';
+  return 'In progress';
 };
 function dateValue(value) {
   if (typeof value === 'number' && Number.isFinite(value)) {
@@ -96,16 +95,35 @@ function mapTables(tableData) {
     description: String(r.description || ''), active: truthy(r.active),
   })).filter(item => item.id && item.active);
   const responsibilityById = new Map(tableData.responsibilities.rows.map(({ record: r }) => [String(r.responsibility_id || ''), r]));
+  const facultyProgress = {};
+  for (const { record: r } of tableData.updates?.rows || []) {
+    const taskId = String(r.task_id || ''); const facultyId = String(r.faculty_id || '');
+    if (!taskId || !facultyId) continue;
+    const updatedAt = String(r.updated_at || '');
+    const previous = facultyProgress[taskId]?.[facultyId];
+    if (!previous || updatedAt >= previous.updatedAt) {
+      facultyProgress[taskId] ||= {};
+      const completionPercent = Math.max(0, Math.min(100, Number(r.completion_percent || 0)));
+      facultyProgress[taskId][facultyId] = { status: completionPercent === 100 ? 'Completed' : normalizeStatus(r.new_status), completionPercent, note: String(r.faculty_note || ''), updatedAt };
+    }
+  }
   const tasks = tableData.tasks.rows.map(({ record: r }) => {
     const facultyIds = findFacultyIds(r.assigned_to, faculty);
     const responsibility = responsibilityById.get(String(r.responsibility_id || ''));
+    const baseStatus = normalizeStatus(r.status);
+    const rawPercent = Math.max(0, Math.min(100, Number(r.completion_percent || 0)));
+    const basePercent = rawPercent === 100 ? 100 : rawPercent;
+    const effectiveBaseStatus = baseStatus === 'Completed' || basePercent === 100 ? 'Completed' : 'In progress';
+    const staffProgress = Object.fromEntries(facultyIds.map(facultyId => [facultyId, facultyProgress[String(r.task_id || '')]?.[facultyId] || { status: effectiveBaseStatus, completionPercent: basePercent, note: '' }]));
+    const values = Object.values(staffProgress);
+    const status = values.length && values.every(value => value.status === 'Completed') ? 'Completed' : 'In progress';
     return {
       id: String(r.task_id || ''), title: String(r.task_title || ''), facultyIds, facultyId: facultyIds[0] || '',
       responsibilityId: String(r.responsibility_id || ''),
       category: String(responsibility?.responsibility_name || r.category || 'Academic'),
       assignedDate: dateValue(r.assigned_date), startDate: dateValue(r.start_date), createdAt: dateValue(r.created_at),
-      dueDate: dateValue(r.deadline), status: normalizeStatus(r.status), completionPercent: Math.max(0, Math.min(100, Number(r.completion_percent || 0))),
-      priority: String(r.priority || 'Medium'), description: String(r.task_description || ''),
+      dueDate: dateValue(r.deadline), status, completionPercent: values.length ? Math.round(values.reduce((sum, value) => sum + (value.status === 'Completed' ? 100 : value.completionPercent), 0) / values.length) : Math.max(0, Math.min(100, Number(r.completion_percent || 0))),
+      facultyProgress: staffProgress, priority: String(r.priority || 'Medium'), description: String(r.task_description || ''),
     };
   }).filter(task => task.id && task.title && !['cancelled', 'canceled', 'archived'].includes(String(
     tableData.tasks.rows.find(row => String(row.record.task_id) === task.id)?.record.status || '',
@@ -113,7 +131,20 @@ function mapTables(tableData) {
   return { faculty, responsibilities, tasks };
 }
 export async function getAll() {
-  if (!sheetsEnabled) return structuredClone(demo);
+  if (!sheetsEnabled) {
+    const data = structuredClone(demo);
+    data.tasks = data.tasks.map(task => {
+      const ids = Array.isArray(task.facultyIds) && task.facultyIds.length ? task.facultyIds : task.facultyId ? [task.facultyId] : [];
+      const status = task.status === 'Completed' || Number(task.completionPercent) === 100 ? 'Completed' : 'In progress';
+      const completionPercent = status === 'Completed' ? 100 : Math.max(0, Math.min(100, Number(task.completionPercent || 0)));
+      const facultyProgress = { ...(task.facultyProgress || {}) };
+      for (const facultyId of ids) facultyProgress[facultyId] ||= { status, completionPercent, note: '' };
+      const progress = Object.values(facultyProgress);
+      const allDone = progress.length && progress.every(item => item.status === 'Completed' || Number(item.completionPercent) === 100);
+      return { ...task, facultyProgress, status: allDone ? 'Completed' : 'In progress', completionPercent: progress.length ? Math.round(progress.reduce((sum, item) => sum + (item.status === 'Completed' ? 100 : Number(item.completionPercent) || 0), 0) / progress.length) : completionPercent };
+    });
+    return data;
+  }
   return mapTables(await readTables());
 }
 
@@ -179,22 +210,40 @@ async function readSingleTable(title) {
   const response = await sheets.spreadsheets.values.get({ spreadsheetId: id, range: `'${title}'!A:Z`, valueRenderOption: 'UNFORMATTED_VALUE' });
   return parseTable(response.data.values);
 }
-async function appendStatusUpdate(taskId, facultyId, oldStatus, newStatus, completionPercent) {
-  const table = await readSingleTable(tabs.updates);
-  const fields = { update_id: `U-${Date.now()}`, task_id: taskId, faculty_id: facultyId, old_status: oldStatus, new_status: newStatus, completion_percent: completionPercent, updated_at: new Date().toISOString() };
+async function ensureUpdateHeaders() {
+  let table = await readSingleTable(tabs.updates);
+  if (!table.headers.length) throw new Error('The Task Updates sheet is missing its header row.');
+  for (const header of ['completion_percent', 'faculty_note']) {
+    if (table.headers.includes(header)) continue;
+    const col = table.headers.length;
+    await sheets.spreadsheets.values.update({ spreadsheetId: id, range: `'${tabs.updates}'!${columnName(col)}1`, valueInputOption: 'RAW', requestBody: { values: [[header]] } });
+    table.headers.push(header);
+  }
+  return table;
+}
+async function appendStatusUpdate(taskId, facultyId, oldStatus, newStatus, completionPercent, facultyNote) {
+  const table = await ensureUpdateHeaders();
+  const fields = { update_id: `U-${Date.now()}`, task_id: taskId, faculty_id: facultyId, old_status: oldStatus, new_status: newStatus, completion_percent: completionPercent, faculty_note: facultyNote, updated_at: new Date().toISOString() };
   const values = Array(table.headers.length).fill('');
   for (const [header, value] of Object.entries(fields)) {
     const col = table.headers.indexOf(header);
     if (col >= 0) values[col] = value;
   }
-  if (table.headers.length) await sheets.spreadsheets.values.append({ spreadsheetId: id, range: `'${tabs.updates}'!A:Z`, valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values: [values] } });
+  await sheets.spreadsheets.values.append({ spreadsheetId: id, range: `'${tabs.updates}'!A:Z`, valueInputOption: 'RAW', insertDataOption: 'INSERT_ROWS', requestBody: { values: [values] } });
 }
-export async function updateTaskStatus(taskId, facultyId, status, completionPercent) {
+export async function updateTaskStatus(taskId, facultyId, status, completionPercent, facultyNote = '') {
   if (!sheetsEnabled) {
-    const task = demo.tasks.find(item => item.id === taskId && item.facultyId === facultyId);
+    const task = demo.tasks.find(item => item.id === taskId && (item.facultyIds?.length ? item.facultyIds : [item.facultyId]).includes(facultyId));
     if (!task) return false;
-    task.status = status;
-    task.completionPercent = completionPercent;
+    const ids = Array.isArray(task.facultyIds) && task.facultyIds.length ? task.facultyIds : [task.facultyId].filter(Boolean);
+    const startStatus = task.status === 'Completed' || Number(task.completionPercent) === 100 ? 'Completed' : 'In progress';
+    const startPercent = startStatus === 'Completed' ? 100 : Number(task.completionPercent) || 0;
+    task.facultyProgress ||= {};
+    for (const id of ids) task.facultyProgress[id] ||= { status: startStatus, completionPercent: startPercent, note: '' };
+    task.facultyProgress[facultyId] = { status, completionPercent, note: facultyNote };
+    const progress = ids.map(id => task.facultyProgress[id] || { status: 'In progress', completionPercent: task.completionPercent || 0 });
+    task.status = progress.every(item => item.status === 'Completed' || Number(item.completionPercent) === 100) ? 'Completed' : 'In progress';
+    task.completionPercent = Math.round(progress.reduce((sum, item) => sum + (item.status === 'Completed' ? 100 : Number(item.completionPercent) || 0), 0) / Math.max(1, progress.length));
     return true;
   }
   const table = await readSingleTable(tabs.tasks);
@@ -211,11 +260,35 @@ export async function updateTaskStatus(taskId, facultyId, status, completionPerc
     await sheets.spreadsheets.values.update({ spreadsheetId: id, range: `'${tabs.tasks}'!${columnName(progressIndex)}1`, valueInputOption: 'RAW', requestBody: { values: [['completion_percent']] } });
   }
   const oldStatus = normalizeStatus(row.values[statusIndex]);
+  const updates = await ensureUpdateHeaders();
+  const latest = {};
+  const initialPercent = Math.max(0, Math.min(100, Number(row.values[progressIndex] || 0)));
+  const initialStatus = initialPercent === 100 ? 'Completed' : normalizeStatus(row.values[statusIndex]);
+  for (const id of findFacultyIds(row.values[assignedIndex], faculty)) latest[id] = { status: initialStatus, completionPercent: initialStatus === 'Completed' ? 100 : initialPercent, note: '' };
+  for (const { record: r } of updates.rows) {
+    if (String(r.task_id || '') !== taskId || !String(r.faculty_id || '')) continue;
+    const id = String(r.faculty_id); const at = String(r.updated_at || '');
+    if (!latest[id] || at >= latest[id].updatedAt) {
+      const completionPercent = Math.max(0, Math.min(100, Number(r.completion_percent || 0)));
+      latest[id] = { status: completionPercent === 100 ? 'Completed' : normalizeStatus(r.new_status), completionPercent, note: String(r.faculty_note || ''), updatedAt: at };
+    }
+  }
+  latest[facultyId] = { status, completionPercent, note: facultyNote };
+  const assigned = findFacultyIds(row.values[assignedIndex], faculty);
+  const recordedFaculty = new Set(updates.rows.filter(({ record: r }) => String(r.task_id || '') === taskId).map(({ record: r }) => String(r.faculty_id || '')));
+  for (const id of assigned) {
+    if (id === facultyId || recordedFaculty.has(id)) continue;
+    const starting = latest[id] || { status: 'In progress', completionPercent: 0 };
+    await appendStatusUpdate(taskId, id, starting.status, starting.status, starting.status === 'Completed' ? 100 : starting.completionPercent, '');
+  }
+  const values = assigned.map(fid => latest[fid] || { status: 'In progress', completionPercent: 0 });
+  const aggregateStatus = values.every(item => item.status === 'Completed') ? 'Completed' : 'In progress';
+  const aggregatePercent = Math.round(values.reduce((sum, item) => sum + (item.status === 'Completed' ? 100 : item.completionPercent), 0) / Math.max(values.length, 1));
   await sheets.spreadsheets.values.batchUpdate({ spreadsheetId: id, requestBody: { valueInputOption: 'RAW', data: [
-    { range: `'${tabs.tasks}'!${columnName(statusIndex)}${row.rowNumber}`, values: [[status]] },
-    { range: `'${tabs.tasks}'!${columnName(progressIndex)}${row.rowNumber}`, values: [[completionPercent]] },
+    { range: `'${tabs.tasks}'!${columnName(statusIndex)}${row.rowNumber}`, values: [[aggregateStatus]] },
+    { range: `'${tabs.tasks}'!${columnName(progressIndex)}${row.rowNumber}`, values: [[aggregatePercent]] },
   ] } });
-  await appendStatusUpdate(taskId, facultyId, oldStatus, status, completionPercent);
+  await appendStatusUpdate(taskId, facultyId, oldStatus, status, completionPercent, facultyNote);
   return true;
 }
 export async function saveAll(data) {

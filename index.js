@@ -79,6 +79,7 @@ app.get('/api/data',auth(),async(req,res)=>{
     const data=await getAll();
     if(req.user.role==='Faculty'){
       data.tasks=data.tasks.filter(t=>(t.facultyIds||[t.facultyId]).includes(req.user.facultyId));
+      data.tasks=data.tasks.map(task=>{const personal=task.facultyProgress?.[req.user.facultyId];return personal?{...task,status:personal.status==='Completed'?'Completed':'In progress',completionPercent:personal.status==='Completed'?100:personal.completionPercent,facultyNote:personal.note||''}:{...task,status:task.status==='Completed'?'Completed':'In progress',completionPercent:task.status==='Completed'?100:task.completionPercent||0,facultyNote:''}});
       data.faculty=data.faculty.filter(f=>f.id===req.user.facultyId);
       data.responsibilities=data.responsibilities.filter(r=>(r.facultyIds||[r.facultyId]).includes(req.user.facultyId));
     }
@@ -87,15 +88,19 @@ app.get('/api/data',auth(),async(req,res)=>{
 });
 app.put('/api/tasks/:id/status',auth(['Faculty']),async(req,res)=>{
   if(!sheetsEnabled&&process.env.NODE_ENV==='production')return res.status(503).json({error:'Google Sheets is not configured for this deployment.'});
-  const {status,completionPercent}=req.body||{};
-  if(!['Not started','In progress','Completed'].includes(status))return res.status(400).json({error:'Invalid task status.'});
-  if(!Number.isInteger(completionPercent)||completionPercent<0||completionPercent>100)return res.status(400).json({error:'Completion must be a whole number from 0 to 100.'});
+  const {status,completionPercent,facultyNote=''}=req.body||{};
+  if(!['In progress','Completed'].includes(status))return res.status(400).json({error:'Invalid task status.'});
+  let percent=status==='Completed'?100:completionPercent;
+  if(status==='In progress'&&(!Number.isInteger(percent)||percent<0||percent>100))return res.status(400).json({error:'Completion must be a whole number from 0 to 100.'});
+  if(percent===100) { percent=100; }
+  const effectiveStatus=percent===100?'Completed':'In progress';
+  if(typeof facultyNote!=='string'||facultyNote.length>2000)return res.status(400).json({error:'Task notes must be 2,000 characters or fewer.'});
   try{
     const data=await getAll();
     const task=data.tasks.find(t=>t.id===req.params.id&&(t.facultyIds||[t.facultyId]).includes(req.user.facultyId));
     if(!task)return res.status(404).json({error:'Task not found.'});
-    if(!await updateTaskStatus(req.params.id,req.user.facultyId,status,completionPercent))return res.status(404).json({error:'Task not found.'});
-    res.json({task:{...task,status,completionPercent}});
+    if(!await updateTaskStatus(req.params.id,req.user.facultyId,effectiveStatus,percent,facultyNote.trim()))return res.status(404).json({error:'Task not found.'});
+    res.json({task:{...task,status:effectiveStatus,completionPercent:percent,facultyNote:facultyNote.trim()}});
   }catch(e){res.status(503).json({error:`Could not update task: ${e.message}`})}
 });
 app.put('/api/admin/data',auth(['HOD']),async(req,res)=>{
